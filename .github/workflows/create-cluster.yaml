@@ -1,0 +1,58 @@
+name: GitHub Actions Demo
+on: [push]
+jobs:
+  setup-cluster:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - run: |
+          echo "🛠️ Installing required tools"
+          wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt update 
+          sudo apt-get install -y terraform packer
+      - run: |
+          echo "🪪 Generate pvt/public key pair"
+          ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/ed25519-cluster <<<y >/dev/null 2>&1
+          ls ~/.ssh
+      - run: |
+          echo "🏗️ Building OS Images"
+          export HCLOUD_TOKEN="${{secrets.HCLOUD_TOKEN}}"
+          curl -sL https://raw.githubusercontent.com/kube-hetzner/terraform-hcloud-kube-hetzner/master/packer-template/hcloud-microos-snapshots.pkr.hcl -o hcloud-microos-snapshots.pkr.hcl
+          packer init hcloud-microos-snapshots.pkr.hcl
+          packer build hcloud-microos-snapshots.pkr.hcl
+      - run: |
+          echo "🏗️ Installing cluster"
+          export TF_VAR_hcloud_token="${{secrets.HCLOUD_TOKEN}}"
+          terraform init --upgrade
+          terraform validate
+          terraform apply -auto-approve
+          KUBECFG=$(terraform output --raw kubeconfig)
+          echo '::add-mask::$KUBECFG'
+          echo "$KUBECFG" > kubeconfig.yaml
+      - run: |
+          echo "🌍 Installing whoami"
+          export KUBECONFIG=kubeconfig.yaml
+          kubectl apply -f whoami/deployment.yaml -f whoami/ingress.yaml -f whoami/service.yaml
+      - run: |
+          echo "🌍 Getting Load Balancer external IP"
+          export HCLOUD_TOKEN="${{secrets.HCLOUD_TOKEN}}"
+          export LBIP=$(curl -H "Authorization: Bearer $HCLOUD_TOKEN" "https://api.hetzner.cloud/v1/load_balancers" | jq '.load_balancers[].public_net.ipv4.ip' -r)
+          echo "LB IP=$LBIP"
+          echo "LBIP=${LBIP}" >> $GITHUB_ENV
+      - name: Send email
+        uses: dawidd6/action-send-mail@v3.10.0
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{secrets.MAIL_USERNAME}}
+          password: ${{secrets.MAIL_PASSWORD}}
+          subject: Cluster installed
+          to: ${{secrets.MAIL_TO}}
+          from: no-reply@null.dev
+          secure: true
+          body: Get kubeconfig.yaml from attachment. Click to test https://${{env.LBIP}}/whoami
+          attachments: kubeconfig.yaml,~/.ssh/ed25519-cluster.pub,~/.ssh/ed25519-cluster,kube.tf
